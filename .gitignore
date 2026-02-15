@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data (runtime-generated)
+data/
+*.db
+*.sqlite3
+changelog.jsonl
+
+# Secrets
+.sesskey
+
+# Test artifacts
+.pytest_cache/
+test_output.txt
+test_result.log
+pytest_out.txt
+pytest_err.txt
+
+# OS
+Thumbs.db
+.DS_Store

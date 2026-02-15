@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gamecompanion"
+version = "0.1.0"
+description = "AI-powered game companion with persistent memory"
+requires-python = ">=3.12"
+dependencies = [
+    "python-fasthtml>=0.12.0",
+    "aiosqlite>=0.20.0",
+    "google-generativeai>=0.8.0",
+    "python-multipart>=0.0.18",
+    "cryptography>=44.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-playwright>=0.6.0",
+    "httpx>=0.28.0",
+]
+
+[project.scripts]
+gamecompanion = "gamecompanion.main:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gamecompanion"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
