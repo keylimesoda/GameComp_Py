@@ -37,6 +37,7 @@ jobs:
           pyinstaller ${{ matrix.pyinstaller_args }} lorekeeper_launcher.py
 
       - name: Package executable
+        shell: bash
         run: |
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             # Windows: single .exe file, no packaging needed
