@@ -24,7 +24,26 @@ from datetime import datetime
 from collections import Counter
 from pathlib import Path
 
-import google.generativeai as genai
+from openai import OpenAI
+from .config import DATA_DIR, DB_PATH, CONFIG_PATH, TEST_MODE
+PORT = int(os.environ.get("GAMECOMPANION_PORT", "5001"))
+from .db import ensure_tables as _ensure_tables, get_db as _get_db
+from .llm import (
+    _format_api_error, _get_available_models, _SYSTEM_PROMPT,
+    _build_system_prompt, _SEARCH_TRIGGER_KEYWORDS, _MOCK_SEARCH_RESULTS,
+    _mock_llm_respond, _call_llm, _parse_llm_response,
+)
+from .rag import (
+    _tokenize, _vectorize, _cosine_sim,
+    _rag_index_message, _rag_recent_message_ids, _build_rag_context,
+)
+from .graph import (
+    _get_node, _upsert_node, _get_nodes_by_kind, _get_all_nodes,
+    _get_all_edges, _add_edge, _remove_edge, _remove_node,
+    _update_json_path, _add_json_path,
+)
+from .memory import _load_stable_context
+
 from fasthtml.common import *
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.requests import Request
@@ -33,75 +52,8 @@ import markdown as _md
 
 # ── Configuration ─────────────────────────────────────────────────────────
 
-PORT = int(os.environ.get("GAMECOMPANION_PORT", "5001"))
-DATA_DIR = Path(os.environ.get("GAMECOMPANION_DATA_DIR", "data"))
-TEST_MODE = os.environ.get("GAMECOMPANION_TEST_MODE") == "1"
-DB_PATH = DATA_DIR / "gamecompanion.db"
-CONFIG_PATH = DATA_DIR / "config.json"
 
 # ── Database helpers ──────────────────────────────────────────────────────
-
-
-def _ensure_tables(db_path: Path):
-    """Create the schema if it doesn't exist yet."""
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(db_path))
-    con.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS playthroughs (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            name        TEXT    NOT NULL,
-            game_title  TEXT    DEFAULT '',
-            created_at  TEXT    DEFAULT (datetime('now')),
-            updated_at  TEXT    DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS messages (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            playthrough_id  INTEGER NOT NULL REFERENCES playthroughs(id),
-            role            TEXT    NOT NULL,   -- 'user' or 'assistant'
-            content         TEXT    NOT NULL,
-            created_at      TEXT    DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS rag_chunks (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            playthrough_id  INTEGER NOT NULL REFERENCES playthroughs(id),
-            message_id      INTEGER NOT NULL REFERENCES messages(id),
-            role            TEXT    NOT NULL,
-            content         TEXT    NOT NULL,
-            tokens_json     TEXT    NOT NULL,
-            created_at      TEXT    DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS graph_nodes (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            playthrough_id  INTEGER NOT NULL REFERENCES playthroughs(id),
-            name            TEXT    NOT NULL,
-            kind            TEXT    NOT NULL,
-            properties_json TEXT    NOT NULL DEFAULT '{}',
-            status          TEXT    DEFAULT 'active',
-            created_at      TEXT    DEFAULT (datetime('now')),
-            updated_at      TEXT    DEFAULT (datetime('now')),
-            UNIQUE(playthrough_id, name)
-        );
-        CREATE TABLE IF NOT EXISTS graph_edges (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            playthrough_id  INTEGER NOT NULL REFERENCES playthroughs(id),
-            source_id       INTEGER NOT NULL REFERENCES graph_nodes(id),
-            target_id       INTEGER NOT NULL REFERENCES graph_nodes(id),
-            label           TEXT    NOT NULL,
-            properties_json TEXT    NOT NULL DEFAULT '{}',
-            created_at      TEXT    DEFAULT (datetime('now')),
-            UNIQUE(playthrough_id, source_id, target_id, label)
-        );
-        """
-    )
-    con.close()
-
-
-def _get_db() -> sqlite3.Connection:
-    """Return a new connection to the SQLite database."""
-    con = sqlite3.connect(str(DB_PATH))
-    con.row_factory = sqlite3.Row
-    return con
 
 
 # ── Config helpers ────────────────────────────────────────────────────────
@@ -130,348 +82,21 @@ def _is_offline(cfg: dict) -> bool:
         return True
 
 
-def _format_api_error(exc: Exception) -> str:
-    raw = str(exc)
-    lower = raw.lower()
-    if "api_key_invalid" in lower or "401" in lower or "invalid api key" in lower:
-        friendly = "Authentication failed. Check your API key."
-    elif "429" in lower or "resource_exhausted" in lower or "rate limit" in lower or "rate_limit" in lower:
-        friendly = "Rate limit reached. Please wait and try again."
-    elif "timeout" in lower or "timed out" in lower or "connection" in lower:
-        friendly = "Network error. Check your connection."
-    else:
-        friendly = "API error. Please try again."
-    details = (
-        "\n\n<details><summary>Details</summary>\n\n"
-        + "```\n"
-        + raw
-        + "\n```\n\n</details>"
-    )
-    return f"⚠️ {friendly}{details}"
 
 
-def _get_available_models(api_key: str) -> list[str]:
-    if TEST_MODE:
-        return ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"]
-    if not api_key:
-        return []
-    try:
-        genai.configure(api_key=api_key)
-        models = [m.name for m in genai.list_models()]
-        return [m for m in models if "gemini" in m.lower()]
-    except Exception:
-        return []
 
 
 # ── LLM helpers ───────────────────────────────────────────────────────────
 
-_SYSTEM_PROMPT = """\
-You are LoreKeeper, a knowledgeable and friendly AI co-pilot for video game \
-playthroughs. You remember everything the player tells you about their game, \
-characters, decisions, and progress. You give helpful advice on builds, strategy, \
-lore, and roleplay. Keep answers concise but thorough. If the player has told you \
-about their character or party, reference that context naturally."""
 
 
-def _build_system_prompt(playthrough_name: str, game_title: str) -> str:
-    """Build a system prompt, enriched with playthrough context if available."""
-    parts = [_SYSTEM_PROMPT]
-    if game_title:
-        parts.append(f"\nThe player is currently playing: {game_title}.")
-    if playthrough_name:
-        parts.append(f"\nPlaythrough name: {playthrough_name}.")
-    return "\n".join(parts)
 
 
 # Keywords that signal a game-specific query needing web search (used by mock LLM)
-_SEARCH_TRIGGER_KEYWORDS = [
-    "beat", "defeat", "boss", "weapon", "armor", "item",
-    "strategy", "guide", "tips", "build", "enemy", "enemies",
-    "immune", "resist", "weakness", "location", "where to find",
-    "how to get", "how do i", "quest", "npc", "spell", "ability",
-    "class", "subclass", "feat", "skill", "level", "stats",
-    "damage", "best", "optimal", "recommend", "counter",
-    "wiki", "patch", "nerf", "buff", "meta",
-]
 
 # Canned search results used by the mock Tavily in test mode
-_MOCK_SEARCH_RESULTS = [
-    {
-        "title": "Game Strategy Guide",
-        "url": "https://www.gamesguide.com/strategy",
-        "content": "Detailed strategy and tips for defeating difficult bosses and challenges.",
-    },
-    {
-        "title": "Wiki Game Guide",
-        "url": "https://wiki.gameinfo.com/guide",
-        "content": "Comprehensive game information including builds, items, and boss strategies.",
-    },
-]
 
 
-def _mock_llm_respond(
-    user_message: str,
-    rag_context: str = "",
-    search_results: str = "",
-    stable_context: dict | None = None,
-) -> str:
-    """Return a deterministic AI response for testing.
-
-    Returns structured JSON matching the M5 format:
-      { "response": "...", "context_deltas": [...], "web_search": null | {...} }
-
-    Priority:
-      1. search_results provided → response with [1],[2] citations
-      2. rag_context provided    → echo RAG context (M3 recall)
-      3. M5 memory updates       → emit context_deltas
-      4. game-keyword detected   → flag web_search for orchestrator
-      5. default                 → canned response, no search
-    """
-    import time
-    time.sleep(0.8)  # Simulate LLM latency so typing indicator is testable
-
-    stable_context = stable_context or {}
-    lower = user_message.lower()
-
-    # Second call: search results provided → return cited response
-    if search_results:
-        return json.dumps({
-            "response": (
-                "Based on my research, here are some helpful tips:\n\n"
-                "You should focus on learning attack patterns and timing your "
-                "dodges carefully. Using spirit summons can help draw aggro "
-                "while you deal damage [1]. There are also special items that "
-                "can give you an advantage in this fight [2].\n\n"
-                "Sources:\n"
-                "[1] https://www.gamesguide.com/strategy\n"
-                "[2] https://wiki.gameinfo.com/guide"
-            ),
-            "context_deltas": [],
-            "web_search": None,
-        })
-
-    # RAG context available → echo it so M3 recall tests pass
-    if rag_context:
-        return json.dumps({
-            "response": rag_context,
-            "context_deltas": [],
-            "web_search": None,
-        })
-
-    # M5: memory updates based on user messages — graph deltas
-    deltas: list[dict] = []
-
-    # Character intro with level + DEX
-    match = re.search(r"my character (\w+) is a level (\d+) ([\w\s-]+?) with (\d+) dex", lower)
-    if match:
-        name = match.group(1).capitalize()
-        level = int(match.group(2))
-        clazz = match.group(3).strip()
-        dex = int(match.group(4))
-        deltas.append({
-            "type": "graph",
-            "operation": "upsert_node",
-            "name": name,
-            "kind": "character",
-            "properties": {
-                "role": "protagonist",
-                "class": clazz,
-                "level": level,
-                "DEX": dex,
-            },
-            "reason": "User provided character details",
-        })
-
-    # Shorter character intro
-    match = re.search(r"(\w+) is a level (\d+) ([\w\s-]+)", lower)
-    if match and "character" not in lower:
-        name = match.group(1).capitalize()
-        level = int(match.group(2))
-        clazz = match.group(3).strip()
-        deltas.append({
-            "type": "graph",
-            "operation": "upsert_node",
-            "name": name,
-            "kind": "character",
-            "properties": {
-                "role": "protagonist",
-                "class": clazz,
-                "level": level,
-            },
-            "reason": "User provided character details",
-        })
-
-    # Character in party without level
-    match = re.search(r"(\w+) is a ([\w\s-]+) in my party", lower)
-    if match:
-        name = match.group(1).capitalize()
-        clazz = match.group(2).strip()
-        deltas.append({
-            "type": "graph",
-            "operation": "upsert_node",
-            "name": name,
-            "kind": "character",
-            "properties": {
-                "role": "party member",
-                "class": clazz,
-            },
-            "reason": "User described party member",
-        })
-
-    # Simple class statement without level
-    match = re.search(r"(\w+) is a ([\w\s-]+)", lower)
-    if match and "level" not in lower and "party" not in lower:
-        name = match.group(1).capitalize()
-        clazz = match.group(2).strip()
-        deltas.append({
-            "type": "graph",
-            "operation": "upsert_node",
-            "name": name,
-            "kind": "character",
-            "properties": {
-                "role": "protagonist",
-                "class": clazz,
-            },
-            "reason": "User provided class",
-        })
-
-    # Level-up detection
-    match = re.search(r"leveled up (\w+) to level (\d+)", lower)
-    if match:
-        name = match.group(1).capitalize()
-        level = int(match.group(2))
-        deltas.append({
-            "type": "graph",
-            "operation": "update_property",
-            "name": name,
-            "property": "level",
-            "value": level,
-            "reason": "User reported level up",
-        })
-
-    # Stat statements / corrections (WIS)
-    match = re.search(r"(\w+) has (\d+) wis", lower)
-    if match:
-        name = match.group(1).capitalize()
-        wis = int(match.group(2))
-        deltas.append({
-            "type": "graph",
-            "operation": "update_property",
-            "name": name,
-            "property": "WIS",
-            "value": wis,
-            "reason": "User provided stat value",
-        })
-    match = re.search(r"that's wrong.*?(\w+) actually has (\d+) wis", lower)
-    if match:
-        name = match.group(1).capitalize()
-        wis = int(match.group(2))
-        deltas.append({
-            "type": "graph",
-            "operation": "update_property",
-            "name": name,
-            "property": "WIS",
-            "value": wis,
-            "reason": "User correction",
-        })
-
-    # World state
-    match = re.search(r"act (\d+).*?at ([\w\s'-]+).*?goal is to ([\w\s'-]+)", lower)
-    if match:
-        act = f"Act {match.group(1)}"
-        location = match.group(2).strip().title()
-        goal = match.group(3).strip()
-        deltas.append({
-            "type": "graph",
-            "operation": "upsert_node",
-            "name": "__world__",
-            "kind": "world",
-            "properties": {
-                "progression": act,
-                "location": location,
-            },
-            "reason": "User reported world state",
-        })
-        deltas.append({
-            "type": "graph",
-            "operation": "add_to_list",
-            "name": "__world__",
-            "property": "activeGoals",
-            "value": goal,
-            "reason": "User reported active goal",
-        })
-
-    # Pin fact
-    match = re.search(r"remember this:\s*(.+)", user_message, re.IGNORECASE)
-    if match:
-        fact = match.group(1).strip()
-        deltas.append({
-            "type": "graph",
-            "operation": "add_to_list",
-            "name": "__narrative__",
-            "property": "threads",
-            "value": fact,
-            "reason": "User pinned a fact",
-        })
-
-    # Non-lethal rule
-    if "non-lethal" in lower or "nonlethal" in lower:
-        deltas.append({
-            "type": "graph",
-            "operation": "add_to_list",
-            "name": "__codex__",
-            "property": "houseRules",
-            "value": "Non-lethal approach whenever possible",
-            "reason": "User stated a house rule",
-        })
-
-    # If deltas were produced, acknowledge
-    if deltas:
-        return json.dumps({
-            "response": "Got it — I'll remember that.",
-            "context_deltas": deltas,
-            "web_search": None,
-        })
-
-    # Use stable context for a memory-driven response
-    if "should i kill" in lower and stable_context:
-        nodes = stable_context.get("nodes", [])
-        keth = next((n for n in nodes if n.get("name", "").lower() == "keth"), None)
-        codex = next((n for n in nodes if n.get("kind") == "codex"), None)
-        house_rules = codex.get("properties", {}).get("houseRules", []) if codex else []
-        if keth and any("non-lethal" in r.lower() or "nonlethal" in r.lower() for r in house_rules):
-            return json.dumps({
-                "response": (
-                    "Given Keth's shadow monk path and your non-lethal approach, "
-                    "I'd avoid killing the goblin if you can subdue or disable it instead."
-                ),
-                "context_deltas": [],
-                "web_search": None,
-            })
-
-    # Detect game-specific queries
-    needs_search = any(kw in lower for kw in _SEARCH_TRIGGER_KEYWORDS)
-    if needs_search:
-        return json.dumps({
-            "response": "I'll look that up for you.",
-            "context_deltas": [],
-            "web_search": {
-                "query": user_message,
-                "reason": "Game-specific question requiring current information",
-            },
-        })
-
-    # Default: no search needed
-    return json.dumps({
-        "response": (
-            "Great question! For a sneaky character, I'd recommend a Gloom Stalker "
-            "Ranger or a Shadow Monk. Both excel at stealth and offer unique "
-            "abilities for staying hidden. The Gloom Stalker gets an extra attack "
-            "on the first round, while the Shadow Monk can teleport between shadows."
-        ),
-        "context_deltas": [],
-        "web_search": None,
-    })
 
 
 # ── RAG helpers ───────────────────────────────────────────────────────────
@@ -488,49 +113,14 @@ RECENT_WINDOW_SIZE = 10
 RAG_TOP_K = 3
 
 
-def _tokenize(text: str) -> list[str]:
-    tokens = re.findall(r"[a-zA-Z0-9]+", text.lower())
-    return [t for t in tokens if t not in _STOPWORDS and len(t) > 1]
 
 
-def _vectorize(text: str) -> Counter:
-    return Counter(_tokenize(text))
 
 
-def _cosine_sim(a: Counter, b: Counter) -> float:
-    if not a or not b:
-        return 0.0
-    common = set(a.keys()) & set(b.keys())
-    if not common:
-        return 0.0
-    dot = sum(a[t] * b[t] for t in common)
-    na = math.sqrt(sum(v * v for v in a.values()))
-    nb = math.sqrt(sum(v * v for v in b.values()))
-    if na == 0.0 or nb == 0.0:
-        return 0.0
-    return dot / (na * nb)
 
 
-def _rag_index_message(
-    db: sqlite3.Connection,
-    playthrough_id: int,
-    message_id: int,
-    role: str,
-    content: str,
-):
-    tokens = _vectorize(content)
-    db.execute(
-        "INSERT INTO rag_chunks (playthrough_id, message_id, role, content, tokens_json) VALUES (?, ?, ?, ?, ?)",
-        (playthrough_id, message_id, role, content, json.dumps(tokens)),
-    )
 
 
-def _rag_recent_message_ids(db: sqlite3.Connection, playthrough_id: int) -> set[int]:
-    rows = db.execute(
-        "SELECT id FROM messages WHERE playthrough_id = ? ORDER BY id DESC LIMIT ?",
-        (playthrough_id, RECENT_WINDOW_SIZE),
-    ).fetchall()
-    return {r["id"] for r in rows}
 
 
 def _rag_search(
@@ -559,20 +149,10 @@ def _rag_search(
     return [c for _, c in scored[:RAG_TOP_K]]
 
 
-def _build_rag_context(
-    db: sqlite3.Connection,
-    playthrough_id: int,
-    user_message: str,
-) -> str:
-    recent_ids = _rag_recent_message_ids(db, playthrough_id)
-    chunks = _rag_search(db, playthrough_id, user_message, exclude_message_ids=recent_ids)
-    if not chunks:
-        return ""
-    return "\n".join(chunks)
 
 
 def _validate_api_key(key: str) -> tuple[bool, str]:
-    """Validate the API key against the real Gemini API.
+    """Validate the API key against the GitHub Copilot endpoint.
 
     Returns (is_valid, message).
     In test mode, 'test-key-valid' always passes.
@@ -584,56 +164,22 @@ def _validate_api_key(key: str) -> tuple[bool, str]:
     if not key or len(key.strip()) < 10:
         return False, "Key is too short"
     try:
-        genai.configure(api_key=key)
-        # Light-weight validation: list available models
-        models = [m.name for m in genai.list_models()]
-        gemini_models = [m for m in models if "gemini" in m.lower()]
-        if not gemini_models:
-            return False, "Key accepted but no Gemini models found"
-        return True, f"Valid — {len(gemini_models)} Gemini model(s) available"
+        from .llm import _get_client, _DEFAULT_MODEL
+        client = _get_client(key)
+        # Light-weight validation: tiny completion
+        resp = client.chat.completions.create(
+            model=_DEFAULT_MODEL,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=1,
+        )
+        return True, "Valid — connected to GitHub Copilot endpoint"
     except Exception as exc:
         msg = str(exc)
-        if "API_KEY_INVALID" in msg or "401" in msg:
-            return False, "Invalid API key — check that you copied it correctly"
+        if "401" in msg or "auth" in msg.lower():
+            return False, "Invalid API key — check your GitHub token"
         return False, f"Validation failed: {msg[:120]}"
 
 
-def _call_gemini(
-    api_key: str,
-    system_prompt: str,
-    history: list[dict],
-    user_message: str,
-    model_name: str = "gemini-2.0-flash",
-    _max_retries: int = 3,
-) -> str:
-    """Send a message to Gemini and return the response text.
-
-    `history` is a list of {"role": "user"|"model", "parts": [text]}.
-    Retries up to `_max_retries` times on 429 / ResourceExhausted with
-    exponential backoff (2s, 4s, 8s).
-    """
-    import time as _time
-
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(
-        model_name=model_name or "gemini-2.0-flash",
-        system_instruction=system_prompt,
-    )
-    chat = model.start_chat(history=history)
-
-    for attempt in range(_max_retries + 1):
-        try:
-            response = chat.send_message(user_message)
-            return response.text
-        except Exception as exc:
-            err = str(exc)
-            is_rate_limit = "429" in err or "ResourceExhausted" in err or "RESOURCE_EXHAUSTED" in err
-            if is_rate_limit and attempt < _max_retries:
-                wait = 2 ** (attempt + 1)  # 2s, 4s, 8s
-                print(f"[Gemini] 429 rate limit — retrying in {wait}s (attempt {attempt + 1}/{_max_retries})")
-                _time.sleep(wait)
-                continue
-            raise
 
 
 # ── Markdown rendering ────────────────────────────────────────────────────
@@ -647,169 +193,25 @@ def _render_ai_message(content: str) -> NotStr:
 # ── Knowledge graph helpers (stable context) ─────────────────────────────
 
 
-def _get_node(db: sqlite3.Connection, playthrough_id: int, name: str) -> dict | None:
-    """Retrieve a single graph node by name. Returns dict with name/kind/properties or None."""
-    row = db.execute(
-        "SELECT name, kind, properties_json, status FROM graph_nodes "
-        "WHERE playthrough_id = ? AND name = ?",
-        (playthrough_id, name),
-    ).fetchone()
-    if not row:
-        return None
-    return {
-        "name": row["name"],
-        "kind": row["kind"],
-        "properties": json.loads(row["properties_json"]),
-        "status": row["status"],
-    }
 
 
-def _upsert_node(
-    db: sqlite3.Connection,
-    playthrough_id: int,
-    name: str,
-    kind: str,
-    properties: dict,
-    status: str = "active",
-):
-    """Create or update a graph node."""
-    db.execute(
-        """
-        INSERT INTO graph_nodes (playthrough_id, name, kind, properties_json, status)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(playthrough_id, name)
-        DO UPDATE SET kind = excluded.kind,
-                      properties_json = excluded.properties_json,
-                      status = excluded.status,
-                      updated_at = datetime('now')
-        """,
-        (playthrough_id, name, kind, json.dumps(properties, ensure_ascii=False), status),
-    )
 
 
-def _get_nodes_by_kind(db: sqlite3.Connection, playthrough_id: int, kind: str) -> list[dict]:
-    """Return all nodes of a given kind for a playthrough."""
-    rows = db.execute(
-        "SELECT name, kind, properties_json, status FROM graph_nodes "
-        "WHERE playthrough_id = ? AND kind = ?",
-        (playthrough_id, kind),
-    ).fetchall()
-    return [
-        {"name": r["name"], "kind": r["kind"],
-         "properties": json.loads(r["properties_json"]), "status": r["status"]}
-        for r in rows
-    ]
 
 
-def _get_all_nodes(db: sqlite3.Connection, playthrough_id: int) -> list[dict]:
-    """Return every node for a playthrough."""
-    rows = db.execute(
-        "SELECT name, kind, properties_json, status FROM graph_nodes "
-        "WHERE playthrough_id = ?",
-        (playthrough_id,),
-    ).fetchall()
-    return [
-        {"name": r["name"], "kind": r["kind"],
-         "properties": json.loads(r["properties_json"]), "status": r["status"]}
-        for r in rows
-    ]
 
 
-def _get_all_edges(db: sqlite3.Connection, playthrough_id: int) -> list[dict]:
-    """Return every edge for a playthrough, with source/target names."""
-    rows = db.execute(
-        "SELECT s.name AS source, t.name AS target, e.label, e.properties_json "
-        "FROM graph_edges e "
-        "JOIN graph_nodes s ON e.source_id = s.id "
-        "JOIN graph_nodes t ON e.target_id = t.id "
-        "WHERE e.playthrough_id = ?",
-        (playthrough_id,),
-    ).fetchall()
-    return [
-        {"source": r["source"], "target": r["target"], "label": r["label"],
-         "properties": json.loads(r["properties_json"])}
-        for r in rows
-    ]
 
 
-def _add_edge(
-    db: sqlite3.Connection,
-    playthrough_id: int,
-    source_name: str,
-    target_name: str,
-    label: str,
-    properties: dict | None = None,
-):
-    """Create an edge between two nodes (both must exist)."""
-    src = db.execute(
-        "SELECT id FROM graph_nodes WHERE playthrough_id = ? AND name = ?",
-        (playthrough_id, source_name),
-    ).fetchone()
-    tgt = db.execute(
-        "SELECT id FROM graph_nodes WHERE playthrough_id = ? AND name = ?",
-        (playthrough_id, target_name),
-    ).fetchone()
-    if not src or not tgt:
-        return
-    db.execute(
-        """
-        INSERT OR IGNORE INTO graph_edges
-            (playthrough_id, source_id, target_id, label, properties_json)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (playthrough_id, src["id"], tgt["id"], label,
-         json.dumps(properties or {}, ensure_ascii=False)),
-    )
 
 
-def _remove_edge(
-    db: sqlite3.Connection,
-    playthrough_id: int,
-    source_name: str,
-    target_name: str,
-    label: str,
-):
-    """Remove an edge between two nodes."""
-    db.execute(
-        """
-        DELETE FROM graph_edges
-        WHERE playthrough_id = ?
-          AND source_id = (SELECT id FROM graph_nodes WHERE playthrough_id = ? AND name = ?)
-          AND target_id = (SELECT id FROM graph_nodes WHERE playthrough_id = ? AND name = ?)
-          AND label = ?
-        """,
-        (playthrough_id, playthrough_id, source_name,
-         playthrough_id, target_name, label),
-    )
 
 
-def _remove_node(db: sqlite3.Connection, playthrough_id: int, name: str):
-    """Delete a node and all its edges."""
-    node = db.execute(
-        "SELECT id FROM graph_nodes WHERE playthrough_id = ? AND name = ?",
-        (playthrough_id, name),
-    ).fetchone()
-    if not node:
-        return
-    nid = node["id"]
-    db.execute(
-        "DELETE FROM graph_edges WHERE playthrough_id = ? AND (source_id = ? OR target_id = ?)",
-        (playthrough_id, nid, nid),
-    )
-    db.execute(
-        "DELETE FROM graph_nodes WHERE id = ?", (nid,),
-    )
 
 
 # ── Stable context load / format (graph-backed) ─────────────────────────
 
 
-def _load_stable_context(db: sqlite3.Connection, playthrough_id: int) -> dict:
-    """Load the full knowledge graph for a playthrough."""
-    return {
-        "nodes": _get_all_nodes(db, playthrough_id),
-        "edges": _get_all_edges(db, playthrough_id),
-    }
 
 
 def _stable_context_to_text(ctx: dict) -> str:
@@ -868,27 +270,8 @@ def _summarize_stable_context(ctx: dict) -> str:
     return "; ".join(parts) if parts else "No stable context saved yet."
 
 
-def _update_json_path(target: dict, path: str, value):
-    parts = path.split(".")
-    cur = target
-    for p in parts[:-1]:
-        if p not in cur or not isinstance(cur[p], dict):
-            cur[p] = {}
-        cur = cur[p]
-    cur[parts[-1]] = value
 
 
-def _add_json_path(target: dict, path: str, value):
-    parts = path.split(".")
-    cur = target
-    for p in parts[:-1]:
-        if p not in cur or not isinstance(cur[p], dict):
-            cur[p] = {}
-        cur = cur[p]
-    if parts[-1] not in cur or not isinstance(cur[parts[-1]], list):
-        cur[parts[-1]] = []
-    if value not in cur[parts[-1]]:
-        cur[parts[-1]].append(value)
 
 
 def _apply_context_deltas(
@@ -1186,7 +569,7 @@ def _maybe_handle_memory_query(message: str, ctx: dict) -> str | None:
 def _strip_json_blobs(text: str) -> str:
     """Remove large JSON objects accidentally leaked into AI response text.
 
-    Gemini sometimes dumps the full knowledge-graph JSON inside its
+    LLM sometimes dumps the full knowledge-graph JSON inside its
     conversational reply.  We detect top-level { … } blocks that look
     like structured data and strip them.
     """
@@ -1225,78 +608,6 @@ def _strip_json_blobs(text: str) -> str:
     return result
 
 
-def _parse_llm_response(raw_text: str) -> dict:
-    """Parse structured JSON from an LLM response, with plain-text fallback.
-
-    Handles several Gemini quirks:
-      1. Clean JSON string
-      2. JSON wrapped in markdown code fences (```json ... ```)
-      3. Natural-language preamble followed by a JSON object — Gemini
-         sometimes writes the conversational reply *then* appends the
-         structured JSON block.  We scan for the last top-level { … }
-         that contains a "response" key.
-
-    If nothing parses, treat the entire text as a plain-text response.
-    """
-    text = raw_text.strip()
-
-    # ── Attempt 1: direct parse (already clean JSON) ──────────────────
-    try:
-        data = json.loads(text)
-        if isinstance(data, dict) and "response" in data:
-            return data
-    except (json.JSONDecodeError, TypeError, ValueError):
-        pass
-
-    # ── Attempt 2: strip markdown code fences ─────────────────────────
-    if "```" in text:
-        # Extract content between first ``` and last ```
-        fence_start = text.find("```")
-        fence_end = text.rfind("```")
-        if fence_end > fence_start:
-            inner = text[fence_start:fence_end + 3]
-            lines = inner.split("\n")
-            # Drop the opening and closing fence lines
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            candidate = "\n".join(lines).strip()
-            try:
-                data = json.loads(candidate)
-                if isinstance(data, dict) and "response" in data:
-                    return data
-            except (json.JSONDecodeError, TypeError, ValueError):
-                pass
-
-    # ── Attempt 3: find the last JSON object containing "response" ────
-    # Gemini often outputs conversational text then appends the JSON.
-    # Walk backwards through '{' positions to find a valid JSON object.
-    brace_positions = [i for i, ch in enumerate(text) if ch == '{']
-    for start in reversed(brace_positions):
-        # Quick sniff: the JSON must contain "response" somewhere after '{'
-        if '"response"' not in text[start:]:
-            continue
-        # Find the matching closing brace by tracking nesting
-        depth = 0
-        end = None
-        for j in range(start, len(text)):
-            if text[j] == '{':
-                depth += 1
-            elif text[j] == '}':
-                depth -= 1
-                if depth == 0:
-                    end = j
-                    break
-        if end is None:
-            continue
-        candidate = text[start:end + 1]
-        try:
-            data = json.loads(candidate)
-            if isinstance(data, dict) and "response" in data:
-                return data
-        except (json.JSONDecodeError, TypeError, ValueError):
-            continue
-
-    # ── Fallback: plain text response, no search ──────────────────────
-    return {"response": raw_text, "web_search": None}
 
 
 # ── Web search helpers ────────────────────────────────────────────────────
@@ -1585,7 +896,7 @@ app, rt = fast_app(
 def get():
     """Root route – redirect based on app state."""
     cfg = _load_config()
-    if not cfg.get("gemini_api_key"):
+    if not cfg.get("api_key"):
         return _welcome_page()
     # If key exists but no playthroughs, go to creation
     db = _get_db()
@@ -1606,10 +917,10 @@ def _welcome_page():
         Div(
             H2("Welcome to LoreKeeper", data_testid="welcome-heading"),
             P(
-                "Enter your Gemini API key to get started. ",
+                "Enter your API key to get started. ",
                 A(
-                    "Get a free Gemini API key →",
-                    href="https://aistudio.google.com/app/apikey",
+                    "Get a free API key →",
+                    href="https://github.com/settings/tokens",
                     target="_blank",
                     data_testid="api-key-provider-link",
                 ),
@@ -1619,7 +930,7 @@ def _welcome_page():
                 cls="secondary",
             ),
             P(
-                "Gemini offers a generous free tier — most casual usage costs nothing.",
+                "Uses your GitHub Copilot token — no extra API key cost.",
                 data_testid="api-key-cost-info",
                 cls="secondary",
             ),
@@ -1628,7 +939,7 @@ def _welcome_page():
                     id="api_key",
                     name="api_key",
                     type="password",
-                    placeholder="Paste your Gemini API key",
+                    placeholder="Paste your API key",
                     data_testid="api-key-input",
                     required=True,
                 ),
@@ -1677,7 +988,7 @@ def post(api_key: str):
 def post(api_key: str, tavily_api_key: str = ""):
     """Save the API key and redirect to playthrough creation."""
     cfg = _load_config()
-    cfg["gemini_api_key"] = api_key
+    cfg["api_key"] = api_key
     if tavily_api_key:
         cfg["tavily_api_key"] = tavily_api_key
     _save_config(cfg)
@@ -1686,11 +997,11 @@ def post(api_key: str, tavily_api_key: str = ""):
 
 def _settings_page(saved: int = 0):
     cfg = _load_config()
-    gemini_set = "set" if cfg.get("gemini_api_key") else "not set"
+    key_set = "set" if cfg.get("api_key") else "not set"
     tavily_set = "set" if cfg.get("tavily_api_key") else "not set"
     debug_mode = bool(cfg.get("debug_mode"))
-    selected_model = cfg.get("model_name", "gemini-2.0-flash")
-    model_options = _get_available_models(cfg.get("gemini_api_key", ""))
+    selected_model = cfg.get("model_name", "gpt-4o")
+    model_options = _get_available_models(cfg.get("api_key", ""))
     db = _get_db()
     pts = db.execute(
         "SELECT id, name FROM playthroughs ORDER BY updated_at DESC, id DESC"
@@ -1702,18 +1013,18 @@ def _settings_page(saved: int = 0):
             H2("Settings", data_testid="settings-heading"),
             Form(
                 Label(
-                    "Gemini API Key: ",
+                    "API Key: ",
                     Span(
-                        gemini_set,
-                        data_testid="gemini-key-status",
-                        style=f"color: {'#4caf50' if gemini_set == 'set' else '#f44336'};",
+                        key_set,
+                        data_testid="api-key-status",
+                        style=f"color: {'#4caf50' if key_set == 'set' else '#f44336'};",
                     ),
                     Input(
-                        id="gemini_api_key",
-                        name="gemini_api_key",
+                        id="api_key",
+                        name="api_key",
                         type="password",
-                        placeholder="Paste your Gemini API key",
-                        data_testid="gemini-key-input",
+                        placeholder="Paste your API key",
+                        data_testid="api-key-input",
                     ),
                 ),
                 Label(
@@ -1740,7 +1051,7 @@ def _settings_page(saved: int = 0):
                     ),
                 ),
                 Div(
-                    "Add your Gemini API key to load models.",
+                    "Add your API key to load models.",
                     cls="secondary",
                 ) if not model_options else "",
                 Label(
@@ -1802,14 +1113,14 @@ def get(saved: int = 0):
 
 @rt("/settings/save")
 def post(
-    gemini_api_key: str = "",
+    api_key: str = "",
     tavily_api_key: str = "",
     debug_mode: str = "",
     model_name: str = "",
 ):
     cfg = _load_config()
-    if gemini_api_key:
-        cfg["gemini_api_key"] = gemini_api_key
+    if api_key:
+        cfg["api_key"] = api_key
     if tavily_api_key:
         cfg["tavily_api_key"] = tavily_api_key
     if model_name:
@@ -2170,7 +1481,7 @@ def post(playthrough_id: int, message: str):
                 message, rag_context, stable_context=stable_context
             )
         else:
-            # Build conversation history for Gemini
+            # Build conversation history for LLM
             past_msgs = db.execute(
                 "SELECT role, content FROM messages WHERE playthrough_id = ? ORDER BY created_at",
                 (playthrough_id,),
@@ -2180,8 +1491,8 @@ def post(playthrough_id: int, message: str):
                 # Skip the message we just inserted — it'll be sent as the new user turn
                 if m["role"] == "user" and m["content"] == message and m is past_msgs[-1]:
                     continue
-                gemini_role = "user" if m["role"] == "user" else "model"
-                history.append({"role": gemini_role, "parts": [m["content"]]})
+                llm_role = "user" if m["role"] == "user" else "assistant"
+                history.append({"role": llm_role, "content": m["content"]})
 
             system_prompt = _build_system_prompt(
                 pt["name"] if pt else "",
@@ -2191,20 +1502,20 @@ def post(playthrough_id: int, message: str):
             if rag_context:
                 system_prompt += "\n\nRelevant prior context:\n" + rag_context
             system_prompt += _STRUCTURED_OUTPUT_INSTRUCTIONS
-            api_key = cfg.get("gemini_api_key", "")
-            model_name = cfg.get("model_name", "gemini-2.0-flash")
-            raw_response = _call_gemini(api_key, system_prompt, history, message, model_name=model_name)
+            api_key = cfg.get("api_key", "")
+            model_name = cfg.get("model_name", "gpt-4o")
+            raw_response = _call_llm(api_key, system_prompt, history, message, model_name=model_name)
 
         # Parse structured JSON (with plain-text fallback)
         if raw_response is not None:
             parsed = _parse_llm_response(raw_response)
             ai_text = parsed["response"]
-            # Strip echo: Gemini sometimes repeats the user's message at the start
+            # Strip echo: LLM sometimes repeats the user's message at the start
             if ai_text and message and ai_text.lstrip().startswith(message.strip()):
                 ai_text = ai_text.lstrip()[len(message.strip()):].lstrip()
                 if not ai_text:
                     ai_text = parsed["response"]  # revert if nothing left
-            # Strip leaked JSON blobs (Gemini sometimes dumps stable context)
+            # Strip leaked JSON blobs (LLM sometimes dumps stable context)
             ai_text = _strip_json_blobs(ai_text)
             deltas = parsed.get("context_deltas", []) or []
             web_search = parsed.get("web_search")
@@ -2251,7 +1562,7 @@ def post(playthrough_id: int, message: str):
                         + "\n"
                         + search_context
                     )
-                    raw_response2 = _call_gemini(
+                    raw_response2 = _call_llm(
                         api_key, system_prompt2, history, message, model_name=model_name
                     )
 
