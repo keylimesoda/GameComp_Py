@@ -897,7 +897,14 @@ def get():
     """Root route – redirect based on app state."""
     cfg = _load_config()
     if not cfg.get("api_key"):
-        return _welcome_page()
+        # Check for saved OAuth token
+        from .auth import load_token
+        saved_token = load_token(DATA_DIR)
+        if saved_token:
+            cfg["api_key"] = saved_token
+            _save_config(cfg)
+        else:
+            return _welcome_page()
     # If key exists but no playthroughs, go to creation
     db = _get_db()
     row = db.execute("SELECT id FROM playthroughs ORDER BY updated_at DESC, id DESC LIMIT 1").fetchone()
@@ -912,18 +919,45 @@ def get():
 
 
 def _welcome_page():
+    # Check if OAuth client ID is configured
+    client_id = os.environ.get("LOREKEEPER_GITHUB_CLIENT_ID", "")
+    oauth_section = []
+    if client_id:
+        oauth_section = [
+            H3("Option 1: Sign in with GitHub (recommended)"),
+            P("Click the button below to authenticate with your GitHub account. No tokens to copy."),
+            Button(
+                "Sign in with GitHub",
+                hx_post="/auth/github/start",
+                hx_target="#auth-status",
+                data_testid="github-login-btn",
+                style="width: 100%;",
+            ),
+            Div(id="auth-status"),
+            Hr(),
+            H3("Option 2: Manual API key"),
+        ]
     return Titled(
         "LoreKeeper",
         Div(
             H2("Welcome to LoreKeeper", data_testid="welcome-heading"),
+            *oauth_section,
             P(
-                "Enter your API key to get started. ",
+                "Enter your GitHub token to get started. " if not client_id else "",
                 A(
-                    "Get a free API key →",
+                    "Get a GitHub token →",
                     href="https://github.com/settings/tokens",
                     target="_blank",
                     data_testid="api-key-provider-link",
                 ),
+            ) if not client_id else P(
+                A(
+                    "Or generate a Personal Access Token →",
+                    href="https://github.com/settings/tokens",
+                    target="_blank",
+                    data_testid="api-key-provider-link",
+                ),
+                cls="secondary",
             ),
             P(
                 "Optional: Add a Tavily API key to enable web search.",
@@ -993,6 +1027,120 @@ def post(api_key: str, tavily_api_key: str = ""):
         cfg["tavily_api_key"] = tavily_api_key
     _save_config(cfg)
     return RedirectResponse("/setup/new-playthrough", status_code=303)
+
+
+# ── GitHub OAuth Device Flow ─────────────────────────────────────────────
+
+# In-memory store for pending device codes (single-user local app)
+_pending_device_flow: dict = {}
+
+@rt("/auth/github/start")
+def post():
+    """Start GitHub OAuth device flow — returns HTMX partial with user code."""
+    client_id = os.environ.get("LOREKEEPER_GITHUB_CLIENT_ID", "")
+    if not client_id:
+        return Div(
+            Span("⚠️ GitHub OAuth not configured. Set LOREKEEPER_GITHUB_CLIENT_ID.", style="color: #f44336;"),
+            data_testid="auth-error",
+        )
+    try:
+        from .auth import request_device_code
+        result = request_device_code(client_id)
+        _pending_device_flow["device_code"] = result["device_code"]
+        _pending_device_flow["interval"] = result.get("interval", 5)
+        _pending_device_flow["expires_in"] = result.get("expires_in", 900)
+        _pending_device_flow["client_id"] = client_id
+        user_code = result["user_code"]
+        verify_uri = result.get("verification_uri", "https://github.com/login/device")
+        return Div(
+            P(
+                "Go to ",
+                A(verify_uri, href=verify_uri, target="_blank", style="font-weight: bold;"),
+                " and enter this code:",
+            ),
+            Div(
+                Code(user_code, style="font-size: 2em; letter-spacing: 0.2em; padding: 0.5em 1em; background: #1a1f2e; border-radius: 8px; display: inline-block;"),
+                style="text-align: center; margin: 1em 0;",
+            ),
+            P("Waiting for authorization...", cls="secondary"),
+            Div(
+                id="auth-poll",
+                hx_get="/auth/github/poll",
+                hx_trigger="every 5s",
+                hx_swap="outerHTML",
+            ),
+            data_testid="auth-device-code",
+        )
+    except Exception as exc:
+        return Div(
+            Span(f"⚠️ {exc}", style="color: #f44336;"),
+            data_testid="auth-error",
+        )
+
+
+@rt("/auth/github/poll")
+def get():
+    """Poll for device flow completion — HTMX auto-polls this."""
+    if "device_code" not in _pending_device_flow:
+        return Div(Span("No pending auth flow.", style="color: #f44336;"))
+
+    client_id = _pending_device_flow["client_id"]
+    device_code = _pending_device_flow["device_code"]
+
+    try:
+        from .auth import _post_form, _TOKEN_URL
+        result = _post_form(_TOKEN_URL, {
+            "client_id": client_id,
+            "device_code": device_code,
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        })
+
+        if "access_token" in result:
+            token = result["access_token"]
+            cfg = _load_config()
+            cfg["api_key"] = token
+            _save_config(cfg)
+            _pending_device_flow.clear()
+
+            # Save token for persistence
+            from .auth import save_token
+            save_token(token, DATA_DIR)
+
+            return Div(
+                Span("✓ Signed in with GitHub!", style="color: #4caf50; font-weight: bold;"),
+                Script("setTimeout(function(){ window.location.href = '/setup/new-playthrough'; }, 1500);"),
+                data_testid="auth-success",
+            )
+
+        error = result.get("error", "")
+        if error == "authorization_pending":
+            return Div(
+                P("⏳ Waiting for you to enter the code...", cls="secondary"),
+                id="auth-poll",
+                hx_get="/auth/github/poll",
+                hx_trigger="every 5s",
+                hx_swap="outerHTML",
+            )
+        elif error == "slow_down":
+            return Div(
+                P("⏳ Waiting...", cls="secondary"),
+                id="auth-poll",
+                hx_get="/auth/github/poll",
+                hx_trigger="every 10s",
+                hx_swap="outerHTML",
+            )
+        elif error in ("expired_token", "access_denied"):
+            _pending_device_flow.clear()
+            return Div(
+                Span(f"✗ Authorization {'expired' if error == 'expired_token' else 'denied'}. Try again.",
+                     style="color: #f44336;"),
+                data_testid="auth-failed",
+            )
+        else:
+            return Div(Span(f"⚠️ {result.get('error_description', error)}", style="color: #f44336;"))
+
+    except Exception as exc:
+        return Div(Span(f"⚠️ {exc}", style="color: #f44336;"))
 
 
 def _settings_page(saved: int = 0):

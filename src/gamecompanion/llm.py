@@ -10,7 +10,7 @@ from openai import OpenAI
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-_COPILOT_ENDPOINT = "https://models.inference.ai.azure.com"
+_COPILOT_ENDPOINT = "https://models.github.ai/inference"
 
 _SYSTEM_PROMPT = """\
 You are LoreKeeper, a knowledgeable and friendly AI co-pilot for video game \

@@ -29,6 +29,6 @@ def llm_client(github_token):
     """Return an OpenAI client pointed at the Copilot endpoint."""
     from openai import OpenAI
     return OpenAI(
-        base_url="https://models.inference.ai.azure.com",
+        base_url="https://models.github.ai/inference",
         api_key=github_token,
     )
